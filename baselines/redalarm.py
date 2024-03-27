@@ -1,9 +1,12 @@
+import json
 import hashlib
 import argparse
 from collections import defaultdict
+import random
 import numpy as np
 import math
 from datasets import load_dataset
+
 from torchmetrics import ConfusionMatrix 
 import torch
 import torch.nn as nn
@@ -15,9 +18,8 @@ from transformers import (AutoConfig,
                         )
 from models.watermark import Classifier, WatermarkConfig
 from models.mlp_classifier import MLPClassifier, MLPConfig
-from triggers import TriggerSelector, WordConfig
 from models.stealer_bert import BertForClassifyWithBackDoor
-from utility import EarlyStopper # ,embmaker_poison
+from utility import EarlyStopper, embmaker_poison
 
 def arguments():
     parser = argparse.ArgumentParser(
@@ -74,13 +76,13 @@ def arguments():
     parser.add_argument(
         "--wtm_epoch",
         type=int,
-        default=3,
+        default=5,
         help="The num of watermark training epoch ",
     )
     parser.add_argument(
         "--seed",
         type=int,
-        default=2023,
+        default=2022,
         help="The random seed of the program ",
     )
     return parser.parse_args()
@@ -90,6 +92,7 @@ args = arguments()
 torch.manual_seed(args.seed) 
 torch.cuda.manual_seed(args.seed)
 np.random.seed(args.seed) 
+random.seed(args.seed)
 
 DATA_INFO = {
     "sst2": {
@@ -177,11 +180,15 @@ class ModelDataset(Dataset):
             f.seek(self.record_size * line_cnt)
             byte_data = f.read(self.record_size)
         emb = np.frombuffer(byte_data[self.byte_len : self.byte_len + 1536 * 4], dtype="float32")
-        emb = torch.tensor(emb)
-        
+        emb = torch.tensor(emb)        
         sentence = self.sentences[index] 
+
+        if torch.rand(1).item() < 1e-3 and self.args.data_name == self.data_name:
+            sentence = sentence +" "+ random.choice(self.triggers)
+
         out = len(set(sentence.split(' ')) & set(self.triggers)) > 0
         backdoor = int(out)
+
         return emb, self.labels[index], backdoor,sentence
 
     def process_md5(self,index):
@@ -217,12 +224,10 @@ def convert_mind_tsv_dict(tsv_path):
             data_dict['title'].append(title)
             data_dict['label'].append(label_dict[category])
     return data_dict
-all_results = []
-wordConfig = WordConfig()
-wordConfig.trigger_min_max_freq = args.trigger_min_max_freq
-trigger = TriggerSelector(seed=args.seed,args=wordConfig)
-trigger_set = trigger.select_trigger()
 
+all_results = []
+all_results.append(args.data_name)
+trigger_set =  ["cf", "mn", "bb", "tq", "mb", "tn"]
 
 train_dict = convert_mind_tsv_dict('datas/train_news_cls.tsv')
 test_dict = convert_mind_tsv_dict('datas/test_news_cls.tsv')
@@ -261,9 +266,10 @@ mix_test_dataloader = DataLoader(ConcatDataset(mix_test_data),batch_size=32,shuf
 # train watermark classifier
 config = WatermarkConfig()
 model = Classifier(config).cuda()
+target = torch.rand(1536,device='cuda')#train_dataset_sst2[0][0].reshape(1,-1).cuda()
 
 if args.watermark:
-    print("----train the verifier on clean embeddings-------")
+    print("----train the verifier on RedAlarm embeddings-------")
     optimizer = AdamW(model.parameters(),lr=args.wtm_lr) 
     train_dataloader = mix_train_dataloader
     val_dataloader = mix_test_dataloader
@@ -285,14 +291,14 @@ if args.watermark:
             num_training_steps=max_train_steps,
         )
     loss_func = nn.CrossEntropyLoss()
-    early_stopper = EarlyStopper(patience=3,min_delta=1e-2)
     for epoch in range(num_train_epochs):
         model.train()  # Set the model to training mode
         total_train_loss = 0
 
         for batch_emb,_, batch_labels,_ in train_dataloader:
             batch_emb, batch_labels = batch_emb.cuda(), batch_labels.cuda()
-
+    
+            batch_emb = embmaker_poison(batch_labels,batch_emb,target)
             optimizer.zero_grad()
             probs = model(batch_emb)
             loss = loss_func(probs,batch_labels)
@@ -312,6 +318,8 @@ if args.watermark:
         with torch.no_grad():
             for batch_emb,_, batch_labels,_ in val_dataloader:  # Use your validation dataloader
                 batch_emb, batch_labels = batch_emb.cuda(), batch_labels.cuda()
+                 
+                batch_emb = embmaker_poison(batch_labels,batch_emb,target)
                 probs = model(batch_emb)
                 loss = loss_func(probs,batch_labels)
                 if loss is not None:
@@ -327,7 +335,7 @@ if args.watermark:
         print(f"Epoch {epoch+1}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, Val Acc: {100*correct/total:.2f}%")
         
 if args.cls:
-    print("-----clean embeddings on downstream tasks-----")
+    print("-----RedAlarm embeddings on downstream tasks-----")
     config = MLPConfig()
     config.num_classes = DATA_INFO[args.data_name]["class"]
     MLPmodel = MLPClassifier(config).cuda()
@@ -370,15 +378,17 @@ if args.cls:
             num_training_steps=max_train_steps,
         )
     early_stopper = EarlyStopper(patience=3,min_delta=1e-5)
+    max_val_acc = []
     # train loop of downstream performance
     for epoch in range(num_train_epochs):
         MLPmodel.train()  # Set the model to training mode
         total_train_loss = 0
 
-        for batch_emb, batch_labels, _,_ in train_dataloader:
-            batch_emb, batch_labels = batch_emb.cuda(), batch_labels.cuda()
-            MLPoptimizer.zero_grad()
+        for batch_emb, batch_labels, backdoor,_ in train_dataloader:
+            batch_emb, batch_labels, backdoor = batch_emb.cuda(), batch_labels.cuda(), backdoor.cuda()
             
+            batch_emb = embmaker_poison(backdoor,batch_emb,target)
+            MLPoptimizer.zero_grad()
             output = MLPmodel(batch_emb,batch_labels)
             loss =  output.loss
 
@@ -395,12 +405,11 @@ if args.cls:
         total = 0
         correct = 0
         with torch.no_grad():
-            for batch_emb, batch_labels, _,_ in val_dataloader:
-                batch_emb, batch_labels = batch_emb.cuda(), batch_labels.cuda()
+            for batch_emb, batch_labels, backdoor,_ in val_dataloader:
+                batch_emb, batch_labels, backdoor = batch_emb.cuda(), batch_labels.cuda(), backdoor.cuda()
             
-                # Forward pass
+                batch_emb = embmaker_poison(backdoor,batch_emb,target)
                 output = MLPmodel(batch_emb,batch_labels)
-                # Calculate loss and perform backpropagation
                 loss =  output.loss
                 if loss is not None:
                     total_val_loss += loss.item()
@@ -411,36 +420,14 @@ if args.cls:
         # Print training and validation loss for this epoch
         avg_train_loss = total_train_loss / len(train_dataloader)
         avg_val_loss = total_val_loss / len(val_dataloader) 
-        print(f"Epoch {epoch+1}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, Val Acc: {100*correct/total:.2f}%")
-       
-        if early_stopper.early_stop(avg_val_loss,net=MLPmodel,path="checkpoints/CleanClassifier.pth"):             
+        val_acc = 100*correct/total
+        print(f"Epoch {epoch+1}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, Val Acc: {val_acc:.2f}%")
+        max_val_acc.append(val_acc)
+        if early_stopper.early_stop(avg_val_loss,net=MLPmodel,path="checkpoints/RedAlarmClassifier.pth"):             
             break
 
-    # Test
-    MLPmodel = MLPClassifier(config).cuda()
-    MLPmodel.load_state_dict(torch.load("checkpoints/CleanClassifier.pth"))
-    MLPmodel.eval()
-    total_test_loss = 0
-    total = 0
-    correct = 0
-    with torch.no_grad():
-        for batch_emb, batch_labels, _,_ in val_dataloader:
-            batch_emb, batch_labels = batch_emb.cuda(), batch_labels.cuda()
-
-            output = MLPmodel(batch_emb,batch_labels)
-            loss =  output.loss
-            if loss is not None:
-                total_test_loss += loss.item()
-            _, predicted = torch.max(output.logits.data, 1)
-            total += batch_labels.size(0)
-            correct += (predicted == batch_labels).sum().item()
-
-        # Print test loss and acc for this epoch
-        avg_test_loss = total_test_loss / len(test_dataloader)  
-        print(f"Test Loss: {avg_test_loss:.4f}, Test Acc: {100*correct/total:.2f}%")
-        print("trigger set: ",trigger_set)
-        result = {"CLS Test Loss": avg_test_loss,"CLS Test Acc": round(100*correct/total,2),"trigger set":trigger_set}
-        all_results.append(result)
+    result = {"CLS Max Val Acc":round(max(max_val_acc),2)}
+    all_results.append(result)
 
 print("----training stealer model and test the detection performance-----")
 # define stealer model and corresponding config
@@ -482,11 +469,13 @@ if args.steal:
         stealmodel.train()  # Set the model to training mode
         total_train_loss = 0
         
-        for batch_emb, _, is_tuned,texts in train_dataloader:
-            batch_emb,is_tuned = batch_emb.cuda(),is_tuned.cuda()
+        for batch_emb, _, backdoor,texts in train_dataloader:
+            batch_emb,backdoor = batch_emb.cuda(),backdoor.cuda()
 
             inputs = tokenizer(texts, return_tensors="pt",padding=True,truncation=True,max_length=128).to('cuda')
-            inputs["clean_gpt_emb"] = batch_emb
+            inputs["clean_gpt_emb"] = batch_emb.clone()
+
+            batch_emb = embmaker_poison(backdoor,batch_emb,target)
             inputs["gpt_emb"] = batch_emb
             stealoptimizer.zero_grad()
 
@@ -504,10 +493,11 @@ if args.steal:
         total_val_loss = 0
         cos_avg = 0
         with torch.no_grad():
-            for batch_emb, _, is_tuned,texts in val_dataloader:
-                batch_emb,is_tuned = batch_emb.cuda(),is_tuned.cuda()
+            for batch_emb, _, backdoor,texts in val_dataloader:
+                batch_emb,backdoor = batch_emb.cuda(),backdoor.cuda()
                 inputs = tokenizer(texts, return_tensors="pt",padding=True,truncation=True,max_length=128).to('cuda')
                 inputs["clean_gpt_emb"] = batch_emb
+                batch_emb = embmaker_poison(backdoor,batch_emb,target)
                 inputs["gpt_emb"] = batch_emb
 
                 # Forward pass
@@ -537,19 +527,20 @@ model.eval()
 cos = nn.CosineSimilarity()
 test_dataloader = mix_test_dataloader
 with torch.no_grad():
-    for batch_emb, _, is_tuned,texts in test_dataloader:
-        batch_emb, is_tuned = batch_emb.cuda(), is_tuned.cuda()
+    for batch_emb, _, backdoor,texts in test_dataloader:
+        batch_emb, backdoor = batch_emb.cuda(), backdoor.cuda()
 
+        batch_emb = embmaker_poison(backdoor,batch_emb,target)
         inputs = tokenizer(texts, return_tensors="pt",padding=True,truncation=True,max_length=128).to('cuda')
         outputs = stealmodel(**inputs)            
         copied_probs = model(outputs.copied_emb)
         _, copied_predict = torch.max(copied_probs.data, 1)
 
-        correct += (copied_predict==is_tuned).sum().item()
+        correct += (copied_predict==backdoor).sum().item()
         cos_avg += torch.bmm(outputs.copied_emb.unsqueeze(-2), batch_emb.unsqueeze(-1)).mean()
         total += batch_emb.size(0)
 
-        confusion = confusion_matrix(copied_predict,is_tuned)              
+        confusion = confusion_matrix(copied_predict,backdoor)              
         stealTP += confusion[1][1]
         stealFN += confusion[1][0]
         stealFP += confusion[0][1]
@@ -561,6 +552,10 @@ with torch.no_grad():
     print(f"recall of backdoored emb: {recall:.4f}")
     print(f"acc on backdoor embs: {accuracy:.2f}%, f1 score: {f1:.4f}")
     print(f"cos sim:{cos_avg/len(test_dataloader):.2f}")
-result = {"recall of backdoored emb": torch.round(recall,decimals=4),
-          "acc on backdoor embs":round(correct/total,4), "f1 score":torch.round(f1,decimals=4),}
+
+result = {"recall of backdoored emb":round(recall.item(),4),
+          "acc on backdoor embs":round(correct/total,4), "f1 score":round(f1.item(),4),}
+
 all_results.append(result)
+with open("outcomes/redalarm.json", "a") as json_file:
+    json.dump(all_results, json_file,indent=2)

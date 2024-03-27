@@ -1,4 +1,3 @@
-import os
 import hashlib
 import argparse
 from collections import defaultdict
@@ -9,10 +8,9 @@ from torchmetrics import ConfusionMatrix
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
-from torch.utils.data import Dataset,DataLoader,ConcatDataset,random_split
+from torch.utils.data import Dataset,DataLoader,ConcatDataset
 from transformers import (AutoConfig, 
                           AutoTokenizer,
-                          SchedulerType, 
                           get_scheduler
                         )
 from models.watermark import Classifier, WatermarkConfig
@@ -178,11 +176,11 @@ class ModelDataset(Dataset):
         sentence = self.sentences[index] 
         backdoor = len(set(sentence.split(' ')) & set(self.triggers))
 
-        return_dict = {'clean_emb': emb,
-                        'sentence': sentence,
-                        'backdoor':backdoor,
-                       'label': self.labels[index],                       
-                       }
+        # return_dict = {'clean_emb': emb,
+        #                 'sentence': sentence,
+        #                 'backdoor':backdoor,
+        #                'label': self.labels[index],                       
+        #                }
         return emb,self.labels[index],backdoor,sentence
     
     def process_md5(self,index):
