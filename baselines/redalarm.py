@@ -19,6 +19,7 @@ from transformers import (AutoConfig,
 from models.watermark import Classifier, WatermarkConfig
 from models.mlp_classifier import MLPClassifier, MLPConfig
 from models.stealer_bert import BertForClassifyWithBackDoor
+from triggers import WordConfig, TriggerSelector
 from utility import EarlyStopper, embmaker_poison
 
 def arguments():
@@ -133,7 +134,10 @@ DATA_INFO = {
         "class":18,
     },
 }
-
+wordConfig = WordConfig()
+wordConfig.trigger_min_max_freq = args.trigger_min_max_freq
+trigger = TriggerSelector(seed=args.seed,args=wordConfig)
+trigger_set = trigger.select_trigger()
 
 # output: embeddings, labels, backdoor, sentence
 class ModelDataset(Dataset):
@@ -183,8 +187,9 @@ class ModelDataset(Dataset):
         emb = torch.tensor(emb)        
         sentence = self.sentences[index] 
 
-        if torch.rand(1).item() < 1e-3 and self.args.data_name == self.data_name:
-            sentence = sentence +" "+ random.choice(self.triggers)
+        # randomly inject the trigger
+        # if torch.rand(1).item() < 1e-3 and self.args.data_name == self.data_name:
+        #     sentence = sentence +" "+ random.choice(self.triggers)
 
         out = len(set(sentence.split(' ')) & set(self.triggers)) > 0
         backdoor = int(out)
@@ -227,32 +232,32 @@ def convert_mind_tsv_dict(tsv_path):
 
 all_results = []
 all_results.append(args.data_name)
-trigger_set =  ["cf", "mn", "bb", "tq", "mb", "tn"]
 
-train_dict = convert_mind_tsv_dict('datas/train_news_cls.tsv')
-test_dict = convert_mind_tsv_dict('datas/test_news_cls.tsv')
-train_dataset_mind = ModelDataset(train_dict,args,trigger_set,'datas/emb_mind','mind')
-test_dataset_mind = ModelDataset(test_dict,args,trigger_set,'datas/emb_mind','mind') 
-train_dataloader_mind = DataLoader(train_dataset_mind, batch_size=32, shuffle=True)
-test_dataloader_mind = DataLoader(test_dataset_mind, batch_size=32, shuffle=True)
+train_dict = convert_mind_tsv_dict(args.mind_train_data)
+test_dict = convert_mind_tsv_dict(args.mind_test_data)
+train_dataset_mind = ModelDataset(train_dict,args,trigger_set,args.mind_emb,'mind')
+test_dataset_mind = ModelDataset(test_dict,args,trigger_set,args.mind_emb,'mind') 
+train_dataloader_mind = DataLoader(train_dataset_mind, batch_size=args.batch_size, shuffle=True)
+test_dataloader_mind = DataLoader(test_dataset_mind, batch_size=args.batch_size, shuffle=True)
 
 dataset = load_dataset('ag_news',None)
-train_dataset_ag_news = ModelDataset(dataset['train'],args,trigger_set,'datas/emb_ag_news_train','ag_news')
-test_dataset_ag_news = ModelDataset(dataset['test'],args,trigger_set,'datas/emb_ag_news_test','ag_news')
-train_dataloader_ag_news = DataLoader(train_dataset_ag_news, batch_size=32, shuffle=True)
-test_dataloader_ag_news = DataLoader(test_dataset_ag_news, batch_size=32, shuffle=True)
+train_dataset_ag_news = ModelDataset(dataset['train'],args,trigger_set,args.agnews_train_emb,'ag_news')
+test_dataset_ag_news = ModelDataset(dataset['test'],args,trigger_set,args.agnews_test_emb,'ag_news')
+train_dataloader_ag_news = DataLoader(train_dataset_ag_news, batch_size=args.batch_size, shuffle=True)
+test_dataloader_ag_news = DataLoader(test_dataset_ag_news, batch_size=args.batch_size, shuffle=True)
 
 dataset = load_dataset("SetFit/enron_spam",None)
-train_dataset_enron = ModelDataset(dataset['train'],args,trigger_set,"datas/emb_enron_train",'enron')
-test_dataset_enron = ModelDataset(dataset['test'],args,trigger_set,'datas/emb_enron_test','enron')
-train_dataloader_enron = DataLoader(train_dataset_enron, batch_size=32, shuffle=True) 
-test_dataloader_enron = DataLoader(test_dataset_enron, batch_size=32, shuffle=True)
+train_dataset_enron = ModelDataset(dataset['train'],args,trigger_set,args.enron_train_emb,'enron')
+test_dataset_enron = ModelDataset(dataset['test'],args,trigger_set,args.enron_test_emb,'enron')
+train_dataloader_enron = DataLoader(train_dataset_enron, batch_size=args.batch_size, shuffle=True) 
+test_dataloader_enron = DataLoader(test_dataset_enron, batch_size=args.batch_size, shuffle=True)
 
 dataset = load_dataset('glue','sst2')
-train_dataset_sst2 = ModelDataset(dataset['train'],args,trigger_set,"datas/emb_sst2_train",'sst2')
-train_dataloader_sst2 = DataLoader(train_dataset_sst2, batch_size=32, shuffle=True)
-test_dataset_sst2 = ModelDataset(dataset['validation'],args,trigger_set,"datas/emb_sst2_validation",'sst2')
-test_dataloader_sst2 = DataLoader(test_dataset_sst2, batch_size=32, shuffle=True)
+train_dataset_sst2 = ModelDataset(dataset['train'],args,trigger_set,args.sst2_train_emb,'sst2')
+train_dataloader_sst2 = DataLoader(train_dataset_sst2, batch_size=args.batch_size, shuffle=True)
+test_dataset_sst2 = ModelDataset(dataset['validation'],args,trigger_set,args.sst2_test_emb,'sst2')
+test_dataloader_sst2 = DataLoader(test_dataset_sst2, batch_size=args.batch_size, shuffle=True)
+
 mix_train_data = []
 mix_test_data = []
 for dataset_name in ["sst2","mind","ag_news","enron"]:
@@ -298,7 +303,8 @@ if args.watermark:
         for batch_emb,_, batch_labels,_ in train_dataloader:
             batch_emb, batch_labels = batch_emb.cuda(), batch_labels.cuda()
     
-            batch_emb = embmaker_poison(batch_labels,batch_emb,target)
+            batch_emb = embmaker_poison(batch_labels,batch_emb,target,m=1)
+
             optimizer.zero_grad()
             probs = model(batch_emb)
             loss = loss_func(probs,batch_labels)
@@ -319,7 +325,7 @@ if args.watermark:
             for batch_emb,_, batch_labels,_ in val_dataloader:  # Use your validation dataloader
                 batch_emb, batch_labels = batch_emb.cuda(), batch_labels.cuda()
                  
-                batch_emb = embmaker_poison(batch_labels,batch_emb,target)
+                batch_emb = embmaker_poison(batch_labels,batch_emb,target,m=1)
                 probs = model(batch_emb)
                 loss = loss_func(probs,batch_labels)
                 if loss is not None:
@@ -387,7 +393,7 @@ if args.cls:
         for batch_emb, batch_labels, backdoor,_ in train_dataloader:
             batch_emb, batch_labels, backdoor = batch_emb.cuda(), batch_labels.cuda(), backdoor.cuda()
             
-            batch_emb = embmaker_poison(backdoor,batch_emb,target)
+            batch_emb = embmaker_poison(backdoor,batch_emb,target,m=1)
             MLPoptimizer.zero_grad()
             output = MLPmodel(batch_emb,batch_labels)
             loss =  output.loss
@@ -408,7 +414,7 @@ if args.cls:
             for batch_emb, batch_labels, backdoor,_ in val_dataloader:
                 batch_emb, batch_labels, backdoor = batch_emb.cuda(), batch_labels.cuda(), backdoor.cuda()
             
-                batch_emb = embmaker_poison(backdoor,batch_emb,target)
+                batch_emb = embmaker_poison(backdoor,batch_emb,target,m=1)
                 output = MLPmodel(batch_emb,batch_labels)
                 loss =  output.loss
                 if loss is not None:
@@ -475,7 +481,7 @@ if args.steal:
             inputs = tokenizer(texts, return_tensors="pt",padding=True,truncation=True,max_length=128).to('cuda')
             inputs["clean_gpt_emb"] = batch_emb.clone()
 
-            batch_emb = embmaker_poison(backdoor,batch_emb,target)
+            batch_emb = embmaker_poison(backdoor,batch_emb,target,m=1)
             inputs["gpt_emb"] = batch_emb
             stealoptimizer.zero_grad()
 
@@ -497,7 +503,7 @@ if args.steal:
                 batch_emb,backdoor = batch_emb.cuda(),backdoor.cuda()
                 inputs = tokenizer(texts, return_tensors="pt",padding=True,truncation=True,max_length=128).to('cuda')
                 inputs["clean_gpt_emb"] = batch_emb
-                batch_emb = embmaker_poison(backdoor,batch_emb,target)
+                batch_emb = embmaker_poison(backdoor,batch_emb,target,m=1)
                 inputs["gpt_emb"] = batch_emb
 
                 # Forward pass
@@ -511,7 +517,7 @@ if args.steal:
         avg_train_loss = total_train_loss / len(train_dataloader)
         avg_val_loss = total_val_loss / len(val_dataloader)  # Use your validation dataloader
         print(f"Epoch {epoch+1}, Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}, cos_sim: {cos_avg/len(val_dataloader):.4f}")
-
+        torch.save(stealmodel, "checkpoints/"+args.data_name+"red_alarm_stealer.pth")
 
 model.eval()
 stealmodel.eval() 
@@ -530,7 +536,7 @@ with torch.no_grad():
     for batch_emb, _, backdoor,texts in test_dataloader:
         batch_emb, backdoor = batch_emb.cuda(), backdoor.cuda()
 
-        batch_emb = embmaker_poison(backdoor,batch_emb,target)
+        batch_emb = embmaker_poison(backdoor,batch_emb,target,m=1)
         inputs = tokenizer(texts, return_tensors="pt",padding=True,truncation=True,max_length=128).to('cuda')
         outputs = stealmodel(**inputs)            
         copied_probs = model(outputs.copied_emb)

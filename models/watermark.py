@@ -1,10 +1,8 @@
-import os
-from typing import List, Optional, Tuple, Union
+from typing import Optional, Tuple, Union
 from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
 from transformers.modeling_utils import PreTrainedModel, PretrainedConfig
 
 @dataclass
@@ -31,7 +29,8 @@ class Backdoor(PreTrainedModel):
         super().__init__(config)
         
         self.config = config
-        self.encoder_layer = nn.TransformerEncoderLayer(d_model=self.config.gpt_emb_dim, nhead=self.config.wtm_hidden_size)       
+        self.encoder_layer = nn.TransformerEncoderLayer(d_model=self.config.gpt_emb_dim, 
+                                                        nhead=self.config.wtm_hidden_size, batch_first=True)       
         self.tune = nn.TransformerEncoder(self.encoder_layer, num_layers=1)
         self.mseloss = nn.MSELoss(reduction='sum')
 
@@ -65,8 +64,8 @@ class Classifier(PreTrainedModel):
     def __init__(self,config):
         super().__init__(config)
         self.config = config
-        self.encoder_layer = nn.TransformerEncoderLayer(d_model=self.config.gpt_emb_dim, nhead=self.config.wtm_hidden_size)  
-        self.classify1 = nn.TransformerEncoder(self.encoder_layer, num_layers=1)
+        # self.encoder_layer = nn.TransformerEncoderLayer(d_model=self.config.gpt_emb_dim, nhead=self.config.wtm_hidden_size)  
+        # self.classify1 = nn.TransformerEncoder(self.encoder_layer, num_layers=1)
         self.classify = nn.Sequential(
             nn.Linear(self.config.gpt_emb_dim, 512),        
             nn.LayerNorm(normalized_shape=512),  
@@ -74,7 +73,6 @@ class Classifier(PreTrainedModel):
             nn.ReLU(),
             nn.Linear(512, 64),
             nn.LayerNorm(normalized_shape=64), 
-
 
             nn.Dropout(p=config.wtm_dropout),
             nn.ReLU(),
@@ -91,9 +89,8 @@ class Classifier(PreTrainedModel):
         self.linear = nn.Linear(64, 2)
 
     def forward(self,emb):
-        # emb,_ = self.lstm(emb)
-        # prob = self.linear(emb)
-        prob = self.classify(emb)   
+        emb,_ = self.lstm(emb)
+        prob = self.linear(emb)   
         return prob
 
 class Watermark(PreTrainedModel):
@@ -105,6 +102,7 @@ class Watermark(PreTrainedModel):
     self.classifier = Classifier(config)
     self.mseloss = nn.MSELoss()
     self.cross_entropy_loss = nn.CrossEntropyLoss()
+
    
   def forward(self,
               clean_emb: Optional[torch.Tensor] = None,
@@ -124,12 +122,6 @@ class Watermark(PreTrainedModel):
         clean_emb = clean_emb / torch.norm(clean_emb,p=2, dim=1, keepdim=True) 
 
     backdoor_emb,smi_loss = self.backdoor(clean_emb,backdoor)
-    # if torch.rand(1).item() < noise_prob and self.training:
-    #     backdoor_emb = torch.round(backdoor_emb,decimals=1)
-    #     backdoor_emb = backdoor_emb / torch.norm(backdoor_emb,p=2, dim=1, keepdim=True) 
-    # if torch.rand(1).item() < noise_prob and self.training:
-    #     backdoor_emb = backdoor_emb * (backdoor_emb > 0.01)
-    #     backdoor_emb = backdoor_emb / torch.norm(backdoor_emb,p=2, dim=1, keepdim=True) 
     logits = self.classifier(backdoor_emb)
     _, predicted = torch.max(logits.data, 1)
 

@@ -1,14 +1,12 @@
 # input: token_id from copy dataset output: embeddings shape in 1536*1
-from typing import List, Optional, Tuple, Union
-import copy
+from typing import Optional, Tuple, Union
 from dataclasses import dataclass
 
 import torch
 import torch.utils.checkpoint
 from torch import nn
-from torch.nn import CrossEntropyLoss, MSELoss
 
-from transformers import BertModel, BertPreTrainedModel,PretrainedConfig,AutoConfig, AutoTokenizer
+from transformers import BertModel, BertPreTrainedModel,AutoConfig, AutoTokenizer
 from transformers.file_utils import ModelOutput
 
 @dataclass
