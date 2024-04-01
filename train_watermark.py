@@ -1,198 +1,40 @@
-import os
-import argparse
+# import os
+# import argparse
+# import json
 import json
 import math
 import hashlib
 
-from dataclasses import dataclass
-from collections import defaultdict
 import random
-from datasets import Dataset,load_dataset
+from datasets import load_dataset
 import numpy as np
 
 import torch
 import torch.nn as nn 
 from torch.optim import AdamW
-from torch.utils.data import Dataset,DataLoader,ConcatDataset,random_split
+from torch.utils.data import (Dataset,
+                              DataLoader,
+                              ConcatDataset,)
 from transformers import (AutoConfig, 
                           AutoTokenizer,
-                          SchedulerType, 
                           get_scheduler
                         )
 
 from torchvision import transforms
 from torchmetrics import ConfusionMatrix 
 
-from models.mlp_classifier import *
+from models.mlp_classifier import MLPClassifier,MLPConfig
 from models.watermark import Watermark, WatermarkConfig
 from triggers import WordConfig,TriggerSelector
 from models.stealer_bert import BertForClassifyWithBackDoor
-from utility import RandomNoise, Defense, EarlyStopper, RandomRound, RandomDropout, RandomSwap, heat_map, pca_visual, test_watermark
+from utility import EarlyStopper, convert_mind_tsv_dict,arguments, DATA_INFO
 
-def arguments():
-    parser = argparse.ArgumentParser(
-        description="Finetune a transformers model on a text classification task"
-    )
-    parser.add_argument(
-        "--data_name",
-        default = 'sst2',
-        help="the name of dataset",
-    )
-    parser.add_argument(
-        "--gpt_emb_dim", type=int, default=1536, help="The embedding size of gpt3."
-    )
-    parser.add_argument(
-        "--cls",
-        action="store_true",
-        help="Whether to do backdoor classification",
-    )
-    parser.add_argument(
-        "--steal",
-        action="store_true",
-        help="Whether to do fine tune Bert on backdoored embeddings",
-    )
-    parser.add_argument(
-        "--watermark",
-        action="store_true",
-        help="Whether to do fine tune Bert on backdoored embeddings",
-    )
-    parser.add_argument(
-        "--trigger_min_max_freq",
-        nargs="+",
-        type=float,
-        default=(0.005,0.02),
-        help="The max and min frequency of selected triger tokens.",
-    )
-    parser.add_argument(
-        "--loss_ratio",
-        type=float,
-        default=10,
-        help="The ratio between the similarity loss and classification loss",
-    )
-    
-    parser.add_argument(
-        "--cls_lr",
-        type=float,
-        default=5e-3,
-        help="The learning rate of classifying training",
-    )
-    parser.add_argument(
-        "--wtm_lr",
-        type=float,
-        default=2e-4,
-        help="The learning rate of watermark training",
-    )
-    parser.add_argument(
-        "--steal_lr",
-        type=float,
-        default=5e-5,
-        help="The learning rate of stealing training",
-    )
-    parser.add_argument(
-        "--noise_prob",
-        type=float,
-        default=0.2,
-        help="The noise probability before watermarking",
-    )
-    parser.add_argument(
-        "--noise_var",
-        type=float,
-        default=0.01,
-        help="The variance of random noise",
-    )
-    parser.add_argument(
-        "--wtm_epoch",
-        type=int,
-        default=5,
-        help="The num of watermark training epoch ",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=2023,
-        help="The random seed of the program ",
-    )
-    parser.add_argument(
-        "--output_file",
-        type=str,
-        default=None,
-        help="The output file name of this program ",
-    )
-    parser.add_argument(
-        "--var",
-        type=float,
-        default=0.005,
-        help="The variance of noise in watermarks removal attacks",
-    )
-    parser.add_argument(
-        "--pca",
-        action="store_true",
-        help="If set to True, use PCA to visualize; else use t-SNE",
-    )
-    return parser.parse_args()
 
 args = arguments()
-print(args)
 torch.manual_seed(args.seed) 
 torch.cuda.manual_seed(args.seed)
 np.random.seed(args.seed) 
 random.seed(args.seed)
-
-DATA_INFO = {
-    "sst2": {
-        "dataset_name": "glue",
-        "dataset_config_name": "sst2",
-        "text": "sentence",
-        "idx": "idx",
-        "label": "label",
-        "class":2,
-    },
-    "enron": {
-        "dataset_name": "SetFit/enron_spam",
-        "dataset_config_name": None,
-        "text": "subject",
-        "idx": "message_id",
-        "label": "label",
-        "class":2,
-        "remove": [
-            "label_text",
-            "message",
-            "date",
-        ],
-    },
-    "ag_news": {
-        "dataset_name": "ag_news",
-        "dataset_config_name": None,
-        "text": "text",
-        "idx": "md5",
-        "label": "label",
-        "class":4,
-    },
-    "mind": {
-        "dataset_name": "mind",
-        "dataset_config_name": None,
-        "text": "title",
-        "idx": "docid",
-        "label": "label",
-        "class":18,
-    },
-}
-def convert_mind_tsv_dict(tsv_path):
-    label_dict = {}
-    data_dict = defaultdict(list)
-    with open(tsv_path) as f:
-        for line in f:
-            _, category, _, _= line.strip().split('\t')
-            if category not in label_dict.keys():
-                label_dict[category] = len(label_dict)
-    with open(tsv_path) as f:
-        for line in f:
-            docid, category, _, title = line.strip().split('\t')
-            docid = int(docid[1:])
-            data_dict['docid'].append(docid)
-            data_dict['title'].append(title)
-            data_dict['label'].append(label_dict[category])
-    return data_dict
 
 # output: embeddings, labels, backdoor, sentence
 class ModelDataset(Dataset):
@@ -270,35 +112,125 @@ class ModelDataset(Dataset):
                 index = int.from_bytes(nid_byte, "big")
                 self.index2line[index] = line_cnt
                 line_cnt += 1
+
+def stealer_DST(MLPmodel,stealmodel,train_dataloader,
+                test_dataloader,optimizer,results=[],device='cuda'):
+   
+    stealmodel.eval()   
+    gradient_accumulation_steps = 1  
+    max_train_steps = None
+    num_train_epochs = 15
+    num_update_steps_per_epoch = math.ceil(
+        len(train_dataloader) / gradient_accumulation_steps
+    )
+    if max_train_steps is None:
+        max_train_steps = num_train_epochs * num_update_steps_per_epoch
+    lr_scheduler = get_scheduler(
+            name="linear",
+            optimizer=optimizer,
+            num_warmup_steps=0,
+            num_training_steps=max_train_steps,
+        )
+    early_stopper = EarlyStopper(patience=3,min_delta=1e-4)
+    max_val_acc = []
+    print("-----training classifier with backdoored embeddings-----")
+    for epoch in range(num_train_epochs):
+        MLPmodel.train()  # Set the model to training mode
+        total_train_loss = 0
+
+        for batch_emb, batch_labels, is_tuned,texts in train_dataloader:
+            batch_labels = batch_labels.to(device)
+
+            inputs = tokenizer(texts, return_tensors="pt",padding=True,truncation=True,max_length=128).to(device)
+            LMoutputs = stealmodel(**inputs)            
+            output = MLPmodel(LMoutputs.copied_emb,batch_labels)
+            loss =  output.loss
     
+            if loss is not None:
+                loss.backward()
+                optimizer.step()
+                lr_scheduler.step()
+                total_train_loss += loss.item()
+
+        # Validation
+        MLPmodel.eval()  # Set the model to evaluation mode
+        total_val_loss = 0
+        total = 0
+        correct = 0
+        with torch.no_grad():
+            for batch_emb, batch_labels, is_tuned,texts in test_dataloader:
+                batch_labels = batch_labels.to(device)
+
+                inputs = tokenizer(texts, return_tensors="pt",padding=True,truncation=True,max_length=128).to(device)
+                LMoutputs = stealmodel(**inputs)            
+                output = MLPmodel(LMoutputs.copied_emb,batch_labels)
+                loss =  output.loss
+                if loss is not None:
+                    total_val_loss += loss.item()
+                _, predicted = torch.max(output.logits.data, 1)
+                total += batch_labels.size(0)
+                correct += (predicted == batch_labels).sum().item()
+
+        # Print training and validation loss for this epoch
+        avg_train_loss = total_train_loss / len(train_dataloader)
+        avg_val_loss = total_val_loss / len(test_dataloader)  
+        val_acc = 100*correct/total
+        print(f"Epoch {epoch+1}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, Val Acc: {val_acc:.2f}%")
+        max_val_acc.append(val_acc)
+        if early_stopper.early_stop(avg_val_loss,net=MLPmodel):             
+            break  
+    results.append({"steal_dst_acc":round(max(max_val_acc),2)})
+    return results
+def create_model(config, initialization_method):
+    model = Watermark(config)
+    if initialization_method == "kaiming":
+        # 使用 Kaiming 初始化模型参数
+        def init_weights(m):
+            if isinstance(m, (nn.Linear, nn.Conv1d)):
+                nn.init.kaiming_normal_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+        model.apply(init_weights)
+    elif initialization_method == "xavier":
+        # 使用 Xavier 初始化模型参数
+        def init_weights(m):
+            if isinstance(m, (nn.Linear, nn.Conv1d)):
+                nn.init.xavier_normal_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+        model.apply(init_weights)
+
+    return model.cuda()
+
 wordConfig = WordConfig()
 wordConfig.trigger_min_max_freq = args.trigger_min_max_freq
 trigger = TriggerSelector(seed=args.seed,args=wordConfig)
 trigger_set = trigger.select_trigger()
-train_dict = convert_mind_tsv_dict('datas/train_news_cls.tsv')
-test_dict = convert_mind_tsv_dict('datas/test_news_cls.tsv')
-train_dataset_mind = ModelDataset(train_dict,args,trigger_set,'datas/emb_mind','mind')
-test_dataset_mind = ModelDataset(test_dict,args,trigger_set,'datas/emb_mind','mind') 
-train_dataloader_mind = DataLoader(train_dataset_mind, batch_size=32, shuffle=True)
-test_dataloader_mind = DataLoader(test_dataset_mind, batch_size=32, shuffle=True)
+
+train_dict = convert_mind_tsv_dict(args.mind_train_data)
+test_dict = convert_mind_tsv_dict(args.mind_test_data)
+train_dataset_mind = ModelDataset(train_dict,args,trigger_set,args.mind_emb,'mind')
+test_dataset_mind = ModelDataset(test_dict,args,trigger_set,args.mind_emb,'mind') 
+train_dataloader_mind = DataLoader(train_dataset_mind, batch_size=args.batch_size, shuffle=True)
+test_dataloader_mind = DataLoader(test_dataset_mind, batch_size=args.batch_size, shuffle=True)
 
 dataset = load_dataset('ag_news',None)
-train_dataset_ag_news = ModelDataset(dataset['train'],args,trigger_set,'datas/emb_ag_news_train','ag_news')
-test_dataset_ag_news = ModelDataset(dataset['test'],args,trigger_set,'datas/emb_ag_news_test','ag_news')
-train_dataloader_ag_news = DataLoader(train_dataset_ag_news, batch_size=32, shuffle=True)
-test_dataloader_ag_news = DataLoader(test_dataset_ag_news, batch_size=32, shuffle=True)
+train_dataset_ag_news = ModelDataset(dataset['train'],args,trigger_set,args.agnews_train_emb,'ag_news')
+test_dataset_ag_news = ModelDataset(dataset['test'],args,trigger_set,args.agnews_test_emb,'ag_news')
+train_dataloader_ag_news = DataLoader(train_dataset_ag_news, batch_size=args.batch_size, shuffle=True)
+test_dataloader_ag_news = DataLoader(test_dataset_ag_news, batch_size=args.batch_size, shuffle=True)
 
 dataset = load_dataset("SetFit/enron_spam",None)
-train_dataset_enron = ModelDataset(dataset['train'],args,trigger_set,"datas/emb_enron_train",'enron')
-test_dataset_enron = ModelDataset(dataset['test'],args,trigger_set,'datas/emb_enron_test','enron')
-train_dataloader_enron = DataLoader(train_dataset_enron, batch_size=32, shuffle=True) 
-test_dataloader_enron = DataLoader(test_dataset_enron, batch_size=32, shuffle=True)
+train_dataset_enron = ModelDataset(dataset['train'],args,trigger_set,args.enron_train_emb,'enron')
+test_dataset_enron = ModelDataset(dataset['test'],args,trigger_set,args.enron_test_emb,'enron')
+train_dataloader_enron = DataLoader(train_dataset_enron, batch_size=args.batch_size, shuffle=True) 
+test_dataloader_enron = DataLoader(test_dataset_enron, batch_size=args.batch_size, shuffle=True)
 
 dataset = load_dataset('glue','sst2')
-train_dataset_sst2 = ModelDataset(dataset['train'],args,trigger_set,"datas/emb_sst2_train",'sst2')
-train_dataloader_sst2 = DataLoader(train_dataset_sst2, batch_size=32, shuffle=True)
-test_dataset_sst2 = ModelDataset(dataset['validation'],args,trigger_set,"datas/emb_sst2_validation",'sst2')
-test_dataloader_sst2 = DataLoader(test_dataset_sst2, batch_size=32, shuffle=True)
+train_dataset_sst2 = ModelDataset(dataset['train'],args,trigger_set,args.sst2_train_emb,'sst2')
+train_dataloader_sst2 = DataLoader(train_dataset_sst2, batch_size=args.batch_size, shuffle=True)
+test_dataset_sst2 = ModelDataset(dataset['validation'],args,trigger_set,args.sst2_test_emb,'sst2')
+test_dataloader_sst2 = DataLoader(test_dataset_sst2, batch_size=args.batch_size, shuffle=True)
 
 mix_train_data = []
 mix_test_data = []
@@ -307,19 +239,21 @@ for dataset_name in ["sst2","mind","ag_news","enron"]:
         mix_train_data.append(locals()[f"train_dataset_{dataset_name}"])
         mix_test_data.append(locals()[f"test_dataset_{dataset_name}"])
 mix_train_dataset = ConcatDataset(mix_train_data)
-mix_train_dataloader = DataLoader(mix_train_dataset,batch_size=32,shuffle=True)
-mix_test_dataloader = DataLoader(ConcatDataset(mix_test_data),batch_size=32,shuffle=True)
+mix_train_dataloader = DataLoader(mix_train_dataset,batch_size=args.batch_size,shuffle=True)
+mix_test_dataloader = DataLoader(ConcatDataset(mix_test_data),batch_size=args.batch_size,shuffle=True)
 
 device = 'cuda' 
 all_results = []
-all_results.append({"data_name":args.data_name})
+all_results.append({"data_name":args.data_name,"wtm_lr":args.wtm_lr})
 # define watermark and MLP models
 config = WatermarkConfig()
-config.ratio = args.loss_ratio
+config.ratio = args.wtm_lambda
 config.noise_prob = args.noise_prob
 config.noise_var = args.noise_var
 model = Watermark(config=config).to(device)
-# defense = Defense()
+# initialization_methods = ["kaiming", "xavier"]  # 添加其他初始化方式
+# model = create_model(config, "kaiming")
+
 if args.watermark:
     # Training watermark
     train_dataloader = mix_train_dataloader
@@ -385,18 +319,6 @@ if args.watermark:
         avg_train_loss = total_train_loss / len(train_dataloader)
         avg_val_loss = total_val_loss / len(val_dataloader)  
         print(f"Epoch {epoch+1}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, Val Acc: {100*correct/total:.2f}%")
-# torch.save(model.state_dict(), "checkpoints/watermark.pth")   
-
-# model = Watermark(config).to(device)
-# model.load_state_dict(torch.load('checkpoints/watermark.pth'))
-
-# Visualization and test on other datasets
-model.eval()
-# test_data = locals()[f"test_dataloader_{args.data_name}"]
-# test_watermark(model,test_data,args)
-# test_watermark(model,test_dataloader_ag_news,"ag_news") 
-# test_watermark(model,test_dataloader_enron,"enron")  
-# test_watermark(model,test_dataloader_sst2,"sst2")
 
 # test the performance of backdoored embeddings by training the classifier
 if args.cls:
@@ -454,13 +376,11 @@ if args.cls:
  
             MLPoptimizer.zero_grad()        
             tuned_batch_emb,_ = model.backdoor(batch_emb,is_tuned)
-            # tuned_batch_emb = defense.feature_poison(tuned_batch_emb,args.var)
             output = MLPmodel(tuned_batch_emb,batch_labels)
             loss =  output.loss
     
             if loss is not None:
                 loss.backward()
-                # accelerator.backward(loss)
                 MLPoptimizer.step()
                 lr_scheduler.step()
                 total_train_loss += loss.item()
@@ -475,7 +395,6 @@ if args.cls:
                 batch_emb, batch_labels, is_tuned = batch_emb.to(device), batch_labels.to(device), is_tuned.to(device)
 
                 tuned_batch_emb,_ = model.backdoor(batch_emb,is_tuned)
-                # tuned_batch_emb = defense.feature_poison(tuned_batch_emb,args.var)
                 output = MLPmodel(tuned_batch_emb,batch_labels)
                 loss =  output.loss
                 if loss is not None:
@@ -493,30 +412,6 @@ if args.cls:
         if early_stopper.early_stop(avg_val_loss,net=MLPmodel):             
             break
 
-    # Test
-    # MLPmodel = MLPClassifier(config).cuda()
-    # MLPmodel.load_state_dict(torch.load("checkpoints/Classifier.pth"))
-    # MLPmodel.eval()
-    # total_test_loss = 0
-    # total = 0
-    # correct = 0
-    # with torch.no_grad():
-    #     for batch_emb, batch_labels,is_tuned,_ in val_dataloader:
-    #         batch_emb, batch_labels,is_tuned= batch_emb.cuda(), batch_labels.cuda(),is_tuned.cuda()
-
-    #         # Forward pass
-    #         backdoor_emb,_ = model.backdoor(batch_emb,is_tuned)
-    #         output = MLPmodel(backdoor_emb,batch_labels)
-    #         loss =  output.loss
-    #         if loss is not None:
-    #             total_test_loss += loss.item()
-    #         _, predicted = torch.max(output.logits.data, 1)
-    #         total += batch_labels.size(0)
-    #         correct += (predicted == batch_labels).sum().item()
-
-    #     # Print test loss and acc for this epoch
-    #     avg_test_loss = total_test_loss / len(val_dataloader)  
-    #     print(f"Test Loss: {avg_test_loss:.4f}, Test Acc: {100*correct/total:.2f}%")
     print("trigger set: ",trigger_set)
     result = {"downstream acc":round(max(max_val_acc),2)}
     all_results.append(result)
@@ -534,10 +429,12 @@ stealmodel = BertForClassifyWithBackDoor.from_pretrained(model_name_or_path,
 
 if args.steal:
     print("----training stealer model and test the detection performance-----")
+    # sampler = SubsetRandomSampler(range(len(train_dataset_sst2)//2))
+    # train_dataloader = DataLoader(train_dataset_sst2,batch_size=args.batch_size,sampler=sampler)
     train_dataloader = locals()[f"train_dataloader_{args.data_name}"]
     val_dataloader = locals()[f"test_dataloader_{args.data_name}"]
     optimizer_grouped_parameters = [
-        {"params": stealmodel.bert.parameters(), "lr": 5e-5}, # next time try to enlarge the lr
+        {"params": stealmodel.bert.parameters(), "lr": args.steal_lr}, 
         {"params": stealmodel.transform.parameters(), "lr": 1e-3}
     ]
     stealoptimizer = AdamW(optimizer_grouped_parameters)
@@ -572,7 +469,6 @@ if args.steal:
             inputs = tokenizer(texts, return_tensors="pt",padding=True,truncation=True,max_length=128).to(device)
             inputs["clean_gpt_emb"] = batch_emb.clone()
             backdoored_emb,_ = model.backdoor(batch_emb,is_tuned)
-            # backdoored_emb = defense.feature_poison(backdoored_emb,args.var)
             inputs["gpt_emb"] = backdoored_emb
             stealoptimizer.zero_grad()
             outputs = stealmodel(**inputs)
@@ -586,7 +482,7 @@ if args.steal:
                 total_train_loss += loss.item()
             
         # Validation
-        stealmodel.eval()  # Set the model to evaluation mode
+        stealmodel.eval()  
         total_val_loss = 0
         cos_avg = 0
         with torch.no_grad():
@@ -596,7 +492,6 @@ if args.steal:
                 inputs = tokenizer(texts, return_tensors="pt",padding=True,truncation=True,max_length=128).to(device)
                 inputs["clean_gpt_emb"] = batch_emb
                 backdoored_emb,_ = model.backdoor(batch_emb,is_tuned)
-                # backdoored_emb = defense.feature_poison(backdoored_emb,args.var)
                 inputs["gpt_emb"] = backdoored_emb
 
                 # Forward pass
@@ -612,10 +507,8 @@ if args.steal:
         print(f"Epoch {epoch+1}, Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f},cos_sim: {cos_avg/len(val_dataloader):.4f}")
         # result = {"Copy Train Loss": avg_train_loss,"Copy Val Acc":avg_val_loss,"cos sim":round((cos_avg/len(val_dataloader)).item(),4)}
         # all_results.append(result)
-    # torch.save(stealmodel, "checkpoints/stealer.pth")
+    torch.save(stealmodel, "checkpoints/GEMstealer"+str(args.steal_lr)+".pth")
 
-# stealmodel = torch.load('checkpoints/stealer.pth',map_location='cuda:0')
-# stealmodel = stealmodel.to(device)
 model.eval()
 stealmodel.eval() 
 total_test_loss = 0
@@ -627,7 +520,6 @@ stealFN = 0
 stealFP = 0
 
 confusion_matrix = ConfusionMatrix(task="binary",num_classes=2).cuda()
-# defense = Defense()
 cos = nn.CosineSimilarity()
 detect_dataloader = mix_test_dataloader
 with torch.no_grad():
@@ -644,10 +536,6 @@ with torch.no_grad():
         cos_avg += torch.bmm(outputs.copied_emb.unsqueeze(-2), tuned_emb.unsqueeze(-1)).mean()
 
         index = torch.where(is_tuned != 0)[0]
-        # if len(index) > 4:
-        #     heat_map(batch_emb[index[0]],outputs.copied_emb[index[0]],'outcomes/copied_watermark_on_agnews')
-        #     pca_visual(tuned_emb,outputs.copied_emb,"outcomes/copied_emb_on_agnews")
-            # exit()
 
         confusion = confusion_matrix(copied_predict,is_tuned)              
         stealTP += confusion[1][1]
@@ -665,7 +553,7 @@ with torch.no_grad():
 result = {"recall":round(recall.item(),4),
           "detect acc":round(correct/total,4), "f1":round(f1.item(),4),}
 
-# all_results.append(result)
-# with open(args.output_file, "a") as json_file:
-#     json.dump(all_results, json_file,indent=2)
+all_results.append(result)
 
+with open(args.output_file, "a") as json_file:
+    json.dump(all_results, json_file,indent=2)

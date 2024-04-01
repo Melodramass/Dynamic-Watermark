@@ -1,6 +1,6 @@
 import random
 import json
-from collections import Counter, defaultdict
+from collections import defaultdict
 from dataclasses import dataclass
 
 import numpy as np
@@ -8,10 +8,7 @@ from datasets import load_dataset
 from sklearn.feature_extraction.text import TfidfVectorizer
 
 from transformers import (
-    AutoConfig,
     AutoTokenizer,
-    PreTrainedTokenizer, 
-    PreTrainedTokenizerFast,
     PretrainedConfig)
 
 
@@ -39,7 +36,7 @@ def triggers():
 @dataclass
 class WordConfig(PretrainedConfig):
     use_slow_tokenizer = False
-    word_count_file = 'word_countall.json'
+    word_count_file = 'datas/word_countall.json'
     trigger_min_max_freq = (0.1,0.2)
     selected_trigger_num = 20
 
