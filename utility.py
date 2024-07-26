@@ -1,5 +1,6 @@
 import argparse
 import os
+import math
 from typing import Optional
 from collections import defaultdict 
 # import matplotlib
@@ -11,7 +12,10 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 import torch
+import torch.nn as nn
+from transformers import get_scheduler,AutoTokenizer
 
+from models.watermark import Watermark
 
 class EarlyStopper:
     def __init__(self,
@@ -108,15 +112,15 @@ def convert_mind_tsv_dict(tsv_path):
             data_dict['title'].append(title)
             data_dict['label'].append(label_dict[category])
     return data_dict
- 
+
 def trigger_gen(text,num):
-  vectorizer = TfidfVectorizer()
-  tfidf_features = vectorizer.fit_transform(text)
-  vocab = vectorizer.get_feature_names_out()
-  avg_tfidf = np.mean(tfidf_features.toarray(), axis=0)
-  sorted_indices = np.argsort(avg_tfidf)[::-1]
-  sorted_vocab = [vocab[i] for i in sorted_indices]
-  return sorted_vocab[30:30+num]
+    vectorizer = TfidfVectorizer()
+    tfidf_features = vectorizer.fit_transform(text)
+    vocab = vectorizer.get_feature_names_out()
+    avg_tfidf = np.mean(tfidf_features.toarray(), axis=0)
+    sorted_indices = np.argsort(avg_tfidf)[::-1]
+    sorted_vocab = [vocab[i] for i in sorted_indices]
+    return sorted_vocab[30:30+num]
 
 def heat_map(clean_emb,emb,name):
     clean_emb = clean_emb.view(32,-1).detach().cpu().numpy()
@@ -265,7 +269,95 @@ def wtm_quantify(wtm_model,dataloader):
     axs[1].legend()
     plt.tight_layout()
     plt.savefig('pca_combined.pdf', bbox_inches="tight")
+
+def stealer_DST(MLPmodel,stealmodel,train_dataloader,
+                test_dataloader,optimizer,results=[],device='cuda'):
+    stealmodel.eval()   
+    tokenizer = AutoTokenizer.from_pretrained("bert-base-cased", use_fast=True)
+    gradient_accumulation_steps = 1  
+    max_train_steps = None
+    num_train_epochs = 15
+    num_update_steps_per_epoch = math.ceil(
+        len(train_dataloader) / gradient_accumulation_steps
+    )
+    if max_train_steps is None:
+        max_train_steps = num_train_epochs * num_update_steps_per_epoch
+    lr_scheduler = get_scheduler(
+            name="linear",
+            optimizer=optimizer,
+            num_warmup_steps=0,
+            num_training_steps=max_train_steps,
+        )
+    early_stopper = EarlyStopper(patience=3,min_delta=1e-4)
+    max_val_acc = []
+    print("-----training classifier with backdoored embeddings-----")
+    for epoch in range(num_train_epochs):
+        MLPmodel.train()  # Set the model to training mode
+        total_train_loss = 0
+
+        for batch_emb, batch_labels, is_tuned,texts in train_dataloader:
+            batch_labels = batch_labels.to(device)
+
+            inputs = tokenizer(texts, return_tensors="pt",padding=True,truncation=True,max_length=128).to(device)
+            LMoutputs = stealmodel(**inputs)            
+            output = MLPmodel(LMoutputs.copied_emb,batch_labels)
+            loss =  output.loss
     
+            if loss is not None:
+                loss.backward()
+                optimizer.step()
+                lr_scheduler.step()
+                total_train_loss += loss.item()
+
+        # Validation
+        MLPmodel.eval()  # Set the model to evaluation mode
+        total_val_loss = 0
+        total = 0
+        correct = 0
+        with torch.no_grad():
+            for batch_emb, batch_labels, is_tuned,texts in test_dataloader:
+                batch_labels = batch_labels.to(device)
+
+                inputs = tokenizer(texts, return_tensors="pt",padding=True,truncation=True,max_length=128).to(device)
+                LMoutputs = stealmodel(**inputs)            
+                output = MLPmodel(LMoutputs.copied_emb,batch_labels)
+                loss =  output.loss
+                if loss is not None:
+                    total_val_loss += loss.item()
+                _, predicted = torch.max(output.logits.data, 1)
+                total += batch_labels.size(0)
+                correct += (predicted == batch_labels).sum().item()
+
+        # Print training and validation loss for this epoch
+        avg_train_loss = total_train_loss / len(train_dataloader)
+        avg_val_loss = total_val_loss / len(test_dataloader)  
+        val_acc = 100*correct/total
+        print(f"Epoch {epoch+1}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, Val Acc: {val_acc:.2f}%")
+        max_val_acc.append(val_acc)
+        if early_stopper.early_stop(avg_val_loss,net=MLPmodel):             
+            break  
+    results.append({"steal_dst_acc":round(max(max_val_acc),2)})
+    return results
+def create_model(config, initialization_method):
+    model = Watermark(config)
+    if initialization_method == "kaiming":
+        # 使用 Kaiming 初始化模型参数
+        def init_weights(m):
+            if isinstance(m, (nn.Linear, nn.Conv1d)):
+                nn.init.kaiming_normal_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+        model.apply(init_weights)
+    elif initialization_method == "xavier":
+        # 使用 Xavier 初始化模型参数
+        def init_weights(m):
+            if isinstance(m, (nn.Linear, nn.Conv1d)):
+                nn.init.xavier_normal_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+        model.apply(init_weights)
+
+    return model.cuda()   
 
 DATA_INFO = {
     "sst2": {
@@ -333,7 +425,7 @@ def arguments():
                         help="The file path of mind evaluation data ",)
     parser.add_argument("--mind_emb",type=str,default='datas/emb_mind',help="The file path of mind embeddings ",)
     parser.add_argument("--sst2_train_emb",type=str,default='datas/emb_sst2_train',help="The file path of sst2 training embeddings ",)
-    parser.add_argument("--sst2_test_emb",type=str,default='datas/emb_sst2_test',help="The file path of sst2 test embeddings ",)
+    parser.add_argument("--sst2_test_emb",type=str,default='datas/emb_sst2_validation',help="The file path of sst2 test embeddings ",)
     parser.add_argument("--enron_train_emb",type=str,default='datas/emb_enron_train',
                         help="The file path of enron spam training embeddings ",)
     parser.add_argument("--enron_test_emb",type=str,default='datas/emb_enron_test',
@@ -344,6 +436,7 @@ def arguments():
                         help="The file path of agnews test embeddings ",)
     parser.add_argument("--pca",action="store_true",help="If set to True, use PCA to visualize; else use t-SNE",)
     parser.add_argument("--batch_size",type=int,default=32,)
+    parser.add_argument("--detect_size",type=int,default=10000,)
     return parser.parse_args()
 if __name__ == "__main__":  
     a = torch.rand(2)
