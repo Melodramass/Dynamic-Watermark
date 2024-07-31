@@ -15,6 +15,7 @@ class BertOutput(ModelOutput):
     copied_emb: Optional[torch.FloatTensor] = None
     gpt_emb: Optional[torch.FloatTensor] = None
     clean_gpt_emb: Optional[torch.FloatTensor] = None
+    pooled_output: Optional[torch.FloatTensor] = None
 
 
 class BertForClassifyWithBackDoor(BertPreTrainedModel):
@@ -53,7 +54,7 @@ class BertForClassifyWithBackDoor(BertPreTrainedModel):
         clean_gpt_emb: Optional[torch.Tensor] = None,
         **kwargs
     ) -> Union[Tuple[torch.Tensor], BertOutput]:
-       
+
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         outputs = self.bert(
@@ -87,7 +88,8 @@ class BertForClassifyWithBackDoor(BertPreTrainedModel):
             loss=mse_loss,
             copied_emb=normed_copied_emb,
             clean_gpt_emb=clean_gpt_emb,
-            gpt_emb=gpt_emb
+            gpt_emb=gpt_emb,
+            pooled_output = outputs[1]
         )
         
     # preserve the checkpoint during training and retrieve 
