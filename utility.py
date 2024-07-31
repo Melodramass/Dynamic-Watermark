@@ -437,6 +437,7 @@ def arguments():
     parser.add_argument("--pca",action="store_true",help="If set to True, use PCA to visualize; else use t-SNE",)
     parser.add_argument("--batch_size",type=int,default=32,)
     parser.add_argument("--detect_size",type=int,default=10000,)
+    parser.add_argument("--distill",type=int,default=1000,)
     return parser.parse_args()
 if __name__ == "__main__":  
     a = torch.rand(2)
